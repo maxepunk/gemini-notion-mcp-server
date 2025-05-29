@@ -1,40 +1,43 @@
-import { Server } from '@modelcontextprotocol/sdk/server/index.js'
-import { CallToolRequestSchema, JSONRPCResponse, ListToolsRequestSchema, Tool } from '@modelcontextprotocol/sdk/types.js'
-import { JSONSchema7 as IJsonSchema } from 'json-schema'
-import { OpenAPIToMCPConverter } from '../openapi/parser'
-import { HttpClient, HttpClientError } from '../client/http-client'
-import { OpenAPIV3 } from 'openapi-types'
-import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { CallToolRequestSchema, ListToolsRequestSchema, Tool } from '@modelcontextprotocol/sdk/types.js';
+import { JSONSchema7 as IJsonSchema } from 'json-schema';
+import { OpenAPIToMCPConverter } from '../openapi/parser'; // Your modified parser
+import { HttpClient, HttpClientError } from '../client/http-client';
+import { OpenAPIV3 } from 'openapi-types';
+import { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 
-type PathItemObject = OpenAPIV3.PathItemObject & {
-  get?: OpenAPIV3.OperationObject
-  put?: OpenAPIV3.OperationObject
-  post?: OpenAPIV3.OperationObject
-  delete?: OpenAPIV3.OperationObject
-  patch?: OpenAPIV3.OperationObject
-}
+// MCP Tool's inputSchema expects specific JSONSchema7 types.
+// The root type should be 'object'. Properties within will be Gemini-formatted by the parser.
+type MCPToolInputSchema = IJsonSchema & { type: 'object' };
 
-type NewToolDefinition = {
-  methods: Array<{
-    name: string
-    description: string
-    inputSchema: IJsonSchema & { type: 'object' }
-    returnSchema?: IJsonSchema
-  }>
-}
+// This type comes from the parser, where inputSchema.type could be 'OBJECT' (Gemini) or 'object'
+type ParserToolMethod = {
+  name: string;
+  description: string;
+  inputSchema: IJsonSchema & { type: 'OBJECT' | 'object' };
+  returnSchema?: IJsonSchema;
+};
 
-// import this class, extend and return server
+type ParserToolsOutput = {
+    methods: Array<ParserToolMethod>;
+};
+
 export class MCPProxy {
-  private server: Server
-  private httpClient: HttpClient
-  private tools: Record<string, NewToolDefinition>
-  private openApiLookup: Record<string, OpenAPIV3.OperationObject & { method: string; path: string }>
+  private server: Server;
+  private httpClient: HttpClient;
+  // Stores tools as provided by the parser (parser's 'gemini' dialect output)
+  private rawMcTools: Record<string, ParserToolsOutput>;
+  // Lookup for OpenAPI operation details, keyed by an internal ID (e.g., 'API-' + uniqueName)
+  private openApiLookup: Record<string, OpenAPIV3.OperationObject & { method: string; path: string }>;
+  // Map from the name exposed to the LLM/MCP client back to the internal openApiLookup key
+  private exposedNameToInternalKeyMap: Map<string, string>;
+
 
   constructor(name: string, openApiSpec: OpenAPIV3.Document) {
-    this.server = new Server({ name, version: '1.0.0' }, { capabilities: { tools: {} } })
-    const baseUrl = openApiSpec.servers?.[0].url
+    this.server = new Server({ name, version: '1.0.0' }, { capabilities: { tools: {} } });
+    const baseUrl = openApiSpec.servers?.[0].url;
     if (!baseUrl) {
-      throw new Error('No base URL found in OpenAPI spec')
+      throw new Error('No base URL found in OpenAPI spec');
     }
     this.httpClient = new HttpClient(
       {
@@ -42,131 +45,155 @@ export class MCPProxy {
         headers: this.parseHeadersFromEnv(),
       },
       openApiSpec,
-    )
+    );
 
-    // Convert OpenAPI spec to MCP tools
-    const converter = new OpenAPIToMCPConverter(openApiSpec)
-    const { tools, openApiLookup } = converter.convertToMCPTools()
-    this.tools = tools
-    this.openApiLookup = openApiLookup
+    const converter = new OpenAPIToMCPConverter(openApiSpec);
+    // convertToMCPTools() in the modified parser now applies the 'gemini' dialect internally.
+    const { tools: parsedTools, openApiLookup: parsedOpenApiLookup } = converter.convertToMCPTools();
+    
+    this.rawMcTools = parsedTools as Record<string, ParserToolsOutput>; // Cast if NewToolMethod changed
+    this.openApiLookup = parsedOpenApiLookup;
+    this.exposedNameToInternalKeyMap = new Map();
 
-    this.setupHandlers()
+    this.setupHandlers();
   }
 
   private setupHandlers() {
-    // Handle tool listing
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
-      const tools: Tool[] = []
+      const mcpToolsForClient: Tool[] = [];
+      this.exposedNameToInternalKeyMap.clear(); // Rebuild map each time tools are listed
 
-      // Add methods as separate tools to match the MCP format
-      Object.entries(this.tools).forEach(([toolName, def]) => {
-        def.methods.forEach(method => {
-          const toolNameWithMethod = `${toolName}-${method.name}`;
-          const truncatedToolName = this.truncateToolName(toolNameWithMethod);
-          tools.push({
-            name: truncatedToolName,
-            description: method.description,
-            inputSchema: method.inputSchema as Tool['inputSchema'],
-          })
-        })
-      })
+      Object.entries(this.rawMcTools).forEach(([toolGroupName, def]) => {
+        def.methods.forEach(parserMethod => {
+          // parserMethod.name is the uniqueName from the parser (e.g., operationId, possibly with suffix)
+          // The internal key for openApiLookup is 'API-' + parserMethod.name
+          const internalLookupKey = `${toolGroupName}-${parserMethod.name}`;
 
-      return { tools }
-    })
+          // This is the name that will be shown to the LLM and used in CallTool requests.
+          // It must be consistent and adhere to any LLM limitations (e.g., length via truncateToolName).
+          const exposedToolName = this.truncateToolName(internalLookupKey);
+          
+          // Store the mapping from the (potentially truncated) exposed name to the full internal key
+          this.exposedNameToInternalKeyMap.set(exposedToolName, internalLookupKey);
 
-    // Handle tool calling
+          const mcpCompatibleInputSchema: MCPToolInputSchema = {
+            ...(parserMethod.inputSchema as IJsonSchema), // Properties within are already Gemini-formatted
+            type: 'object', // MCP SDK/client expects 'object' at the root of inputSchema
+          };
+          // If parser set root to 'OBJECT' for Gemini, ensure it's 'object' for the MCP Tool object.
+          if (parserMethod.inputSchema.type === 'OBJECT') {
+             mcpCompatibleInputSchema.type = 'object';
+          }
+
+          mcpToolsForClient.push({
+            name: exposedToolName,
+            description: parserMethod.description,
+            inputSchema: mcpCompatibleInputSchema,
+          });
+        });
+      });
+
+      return { tools: mcpToolsForClient };
+    });
+
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      const { name, arguments: params } = request.params
+      const { name: requestedToolName, arguments: params } = request.params;
 
-      // Find the operation in OpenAPI spec
-      const operation = this.findOperation(name)
+      // Use the map to find the full internal key
+      const internalLookupKey = this.exposedNameToInternalKeyMap.get(requestedToolName);
+
+      if (!internalLookupKey) {
+        console.error(`Tool name "${requestedToolName}" not found in exposedNameToInternalKeyMap. Available exposed names: [${Array.from(this.exposedNameToInternalKeyMap.keys()).join(', ')}]`);
+        throw new Error(`Method ${requestedToolName} not found or mapping failed.`);
+      }
+
+      const operation = this.openApiLookup[internalLookupKey];
+      
       if (!operation) {
-        throw new Error(`Method ${name} not found`)
+         // This should ideally not happen if the map is correct
+        console.error(`Internal lookup key "${internalLookupKey}" (from exposed name "${requestedToolName}") not found in openApiLookup. Available internal keys: [${Object.keys(this.openApiLookup).join(', ')}]`);
+        throw new Error(`Internal error: Operation for ${requestedToolName} (key: ${internalLookupKey}) not found.`);
       }
 
       try {
-        // Execute the operation
-        const response = await this.httpClient.executeOperation(operation, params)
-
-        // Convert response to MCP format
+        const response = await this.httpClient.executeOperation(operation, params);
         return {
           content: [
             {
-              type: 'text', // currently this is the only type that seems to be used by mcp server
-              text: JSON.stringify(response.data), // TODO: pass through the http status code text?
+              type: 'text', // MCP primarily uses text for results
+              text: JSON.stringify(response.data),
             },
           ],
-        }
+        };
       } catch (error) {
-        console.error('Error in tool call', error)
+        console.error(`Error executing tool ${requestedToolName} (internal key: ${internalLookupKey}):`, error);
         if (error instanceof HttpClientError) {
-          console.error('HttpClientError encountered, returning structured error', error)
-          const data = error.data?.response?.data ?? error.data ?? {}
+          const errorData = error.data?.response?.data ?? error.data ?? {};
           return {
             content: [
               {
                 type: 'text',
                 text: JSON.stringify({
-                  status: 'error', // TODO: get this from http status code?
-                  ...(typeof data === 'object' ? data : { data: data }),
+                  status: 'error',
+                  message: error.message,
+                  details: (typeof errorData === 'object' ? errorData : { data: errorData }),
+                  statusCode: error.data?.response?.status
                 }),
               },
             ],
-          }
+          };
         }
-        throw error
+        // For other errors, rethrow to let the MCP SDK handle generic error formatting if it does.
+        // Or, provide a structured error as well.
+        return {
+            content: [
+                {
+                    type: 'text',
+                    text: JSON.stringify({
+                        status: 'error',
+                        message: (error instanceof Error ? error.message : 'An unknown error occurred'),
+                    }),
+                }
+            ]
+        }
       }
-    })
-  }
-
-  private findOperation(operationId: string): (OpenAPIV3.OperationObject & { method: string; path: string }) | null {
-    return this.openApiLookup[operationId] ?? null
+    });
   }
 
   private parseHeadersFromEnv(): Record<string, string> {
-    const headersJson = process.env.OPENAPI_MCP_HEADERS
+    const headersJson = process.env.OPENAPI_MCP_HEADERS;
     if (!headersJson) {
-      return {}
+      return {};
     }
-
     try {
-      const headers = JSON.parse(headersJson)
+      const headers = JSON.parse(headersJson);
       if (typeof headers !== 'object' || headers === null) {
-        console.warn('OPENAPI_MCP_HEADERS environment variable must be a JSON object, got:', typeof headers)
-        return {}
+        console.warn('OPENAPI_MCP_HEADERS environment variable must be a JSON object, got:', typeof headers);
+        return {};
       }
-      return headers
+      return headers;
     } catch (error) {
-      console.warn('Failed to parse OPENAPI_MCP_HEADERS environment variable:', error)
-      return {}
+      console.warn('Failed to parse OPENAPI_MCP_HEADERS environment variable:', error);
+      return {};
     }
-  }
-
-  private getContentType(headers: Headers): 'text' | 'image' | 'binary' {
-    const contentType = headers.get('content-type')
-    if (!contentType) return 'binary'
-
-    if (contentType.includes('text') || contentType.includes('json')) {
-      return 'text'
-    } else if (contentType.includes('image')) {
-      return 'image'
-    }
-    return 'binary'
   }
 
   private truncateToolName(name: string): string {
-    if (name.length <= 64) {
+    const maxLength = 64; 
+    if (name.length <= maxLength) {
       return name;
     }
-    return name.slice(0, 64);
+    // Simple truncation. Consider if a more sophisticated approach is needed to avoid collisions
+    // if multiple long names truncate to the same short name (though ensureUniqueName in parser should help).
+    console.warn(`Tool name "${name}" was truncated to "${name.slice(0, maxLength)}" due to length limits.`);
+    return name.slice(0, maxLength);
   }
 
   async connect(transport: Transport) {
-    // The SDK will handle stdio communication
-    await this.server.connect(transport)
+    await this.server.connect(transport);
   }
 
   getServer() {
-    return this.server
+    return this.server;
   }
 }
