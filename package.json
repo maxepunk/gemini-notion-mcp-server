@@ -1,17 +1,19 @@
 {
-  "name": "@notionhq/notion-mcp-server",
+  "name": "@maxepunk/gemini-notion-mcp-server",
   "keywords": [
     "notion",
     "api",
     "mcp",
-    "server"
+    "server",
+    "gemini"
   ],
-  "version": "1.8.1",
+  "version": "1.0.0-gemini",
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "build": "tsc -build && node scripts/build-cli.js",
-    "dev": "tsx watch scripts/start-server.ts"
+    "build": "tsc -b && node scripts/build-cli.js",
+    "dev": "tsx watch scripts/start-server.ts",
+    "prepublishOnly": "npm run build"
   },
   "bin": {
     "notion-mcp-server": "bin/cli.mjs"
@@ -42,17 +44,17 @@
     "openai": "^4.91.1",
     "tsx": "^4.19.3",
     "typescript": "^5.8.2",
-    "vitest": "^3.1.1"
+    "vitest": "3.1.1"
   },
-  "description": "Official MCP server for Notion API",
-  "main": "index.js",
+  "description": "Gemini-compatible MCP server for Notion API, based on the official server.",
+  "main": "build/src/init-server.js",
   "repository": {
     "type": "git",
-    "url": "git@github.com:makenotion/notion-mcp-server.git"
+    "url": "git+https://github.com/maxepunk/gemini-notion-mcp-server.git"
   },
-  "author": "@notionhq",
+  "author": "maxepunk",
   "bugs": {
-    "url": "https://github.com/makenotion/notion-mcp-server/issues"
+    "url": "https://github.com/maxepunk/gemini-notion-mcp-server/issues"
   },
-  "homepage": "https://github.com/makenotion/notion-mcp-server#readme"
+  "homepage": "https://github.com/maxepunk/gemini-notion-mcp-server#readme"
 }
